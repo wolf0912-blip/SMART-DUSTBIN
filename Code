@@ -1,0 +1,387 @@
+/*
+  ESP32 Smart Dustbin - Wet / Dry Waste Segregator + Web Dashboard
+  -----------------------------------------------------------------
+  NO extra libraries needed. WiFi, WebServer and Preferences are built
+  into the ESP32 board package. Servo is driven with the ESP32's own PWM.
+  Works with ESP32 Arduino core 2.x and 3.x.
+
+  WIRING
+    HC-SR04  VCC  -> 5V (VIN)
+             GND  -> GND
+             TRIG -> GPIO 5
+             ECHO -> GPIO 18  (use voltage divider: ECHO -> 1k -> GPIO18 -> 2k -> GND)
+    Servo    VCC  -> 5V (external supply recommended, common GND with ESP32)
+             GND  -> GND
+             SIG  -> GPIO 13
+    Soil     VCC  -> 3.3V
+    sensor   GND  -> GND
+             AO   -> GPIO 34
+
+  HOW TO VIEW THE WEBSITE
+    Default (AP mode):
+      1. Power the ESP32.
+      2. On your phone/laptop connect to WiFi "SmartDustbin" (password 12345678).
+      3. Open browser: http://192.168.4.1
+    Home WiFi mode:
+      Set USE_HOME_WIFI = true and enter your WiFi name/password below.
+      The IP address is printed in Serial Monitor (115200 baud).
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+// ================= Pins =================
+#define TRIG_PIN   5
+#define ECHO_PIN   18
+#define SERVO_PIN  13
+#define SOIL_PIN   34
+
+// ================= WiFi settings =================
+const bool  USE_HOME_WIFI = false;          // false = ESP32 makes its own WiFi
+const char* HOME_SSID     = "P4x";
+const char* HOME_PASS     = "456789ten";
+const char* AP_SSID       = "SmartDustbin";
+const char* AP_PASS       = "12345678";     // minimum 8 characters
+
+// ================= Servo angles (adjust for your mechanism) =================
+#define ANGLE_CENTER 90
+#define ANGLE_DRY    20      // tray tilts to DRY bin
+#define ANGLE_WET    160     // tray tilts to WET bin
+
+// ================= Tuning =================
+#define DETECT_CM      12     // object closer than this = waste on tray
+#define SETTLE_MS      1500   // wait for waste to settle on soil probe
+#define TILT_HOLD_MS   2000   // how long tray stays tilted
+#define COOLDOWN_MS    1000
+#define SOIL_SAMPLES   20
+
+// Soil calibration (ESP32 ADC range 0-4095).
+// Most modules read HIGH when dry and LOWER when wet.
+// Watch the "Soil" value on the website / Serial Monitor and adjust.
+#define SOIL_DRY_VALUE  3500
+#define SOIL_WET_VALUE  1500
+#define SOIL_THRESHOLD  ((SOIL_DRY_VALUE + SOIL_WET_VALUE) / 2)   // below = WET
+
+// ================= Servo PWM (no library) =================
+#define SERVO_FREQ 50
+#define SERVO_RES  16
+#define SERVO_CH   0
+
+void servoAttach() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES);
+#else
+  ledcSetup(SERVO_CH, SERVO_FREQ, SERVO_RES);
+  ledcAttachPin(SERVO_PIN, SERVO_CH);
+#endif
+}
+
+void servoWrite(int angle) {
+  angle = constrain(angle, 0, 180);
+  int pulseUs = map(angle, 0, 180, 500, 2400);
+  uint32_t duty = (uint32_t)((pulseUs / 20000.0) * 65535.0);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(SERVO_PIN, duty);
+#else
+  ledcWrite(SERVO_CH, duty);
+#endif
+}
+
+// ================= Globals =================
+WebServer   server(80);
+Preferences prefs;
+
+unsigned long wetCount = 0;
+unsigned long dryCount = 0;
+String lastItem = "None yet";
+int    lastSoil = 0;
+
+enum State { IDLE, SETTLING, TILTED, COOLDOWN };
+State state = IDLE;
+unsigned long stateStart = 0;
+unsigned long lastPoll   = 0;
+
+// ================= Web page =================
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Dustbin</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8;
+          --wet:#38bdf8; --dry:#fbbf24; --ok:#22c55e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Arial,sans-serif; background:var(--bg);
+         color:var(--text); padding:20px; }
+  .wrap { max-width:720px; margin:0 auto; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin-bottom:20px; font-size:.9rem; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .card { background:var(--card); border-radius:16px; padding:22px; text-align:center; }
+  .card .label { color:var(--muted); font-size:.85rem; letter-spacing:.05em; text-transform:uppercase; }
+  .card .num { font-size:3.4rem; font-weight:700; margin:6px 0; }
+  .wet .num { color:var(--wet); } .dry .num { color:var(--dry); }
+  .full { grid-column:1 / -1; }
+  .row { display:flex; justify-content:space-between; padding:8px 0;
+         border-bottom:1px solid #334155; font-size:.95rem; }
+  .row:last-child { border:none; }
+  .row span:first-child { color:var(--muted); }
+  .bar { height:14px; border-radius:7px; background:var(--dry); overflow:hidden; margin-top:10px; }
+  .bar div { height:100%; background:var(--wet); width:50%; transition:width .5s; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+         background:var(--ok); margin-right:6px; }
+  .offline .dot { background:#ef4444; }
+  button { background:#334155; color:var(--text); border:none; border-radius:10px;
+           padding:10px 18px; font-size:.9rem; cursor:pointer; margin-top:14px; }
+  button:hover { background:#475569; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Smart Dustbin</h1>
+  <div class="sub" id="conn"><span class="dot"></span><span id="connTxt">Connecting...</span></div>
+
+  <div class="grid">
+    <div class="card wet"><div class="label">Wet waste</div><div class="num" id="wet">0</div></div>
+    <div class="card dry"><div class="label">Dry waste</div><div class="num" id="dry">0</div></div>
+
+    <div class="card full">
+      <div class="label">Total items: <b id="total">0</b></div>
+      <div class="bar"><div id="bar"></div></div>
+    </div>
+
+    <div class="card full" style="text-align:left">
+      <div class="row"><span>Status</span><span id="state">-</span></div>
+      <div class="row"><span>Last item</span><span id="last">-</span></div>
+      <div class="row"><span>Live soil reading</span><span id="soil">-</span></div>
+      <div style="text-align:center">
+        <button onclick="resetCounts()">Reset counts</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+async function update() {
+  try {
+    const r = await fetch('/data');
+    const d = await r.json();
+    $('wet').textContent = d.wet;
+    $('dry').textContent = d.dry;
+    const total = d.wet + d.dry;
+    $('total').textContent = total;
+    $('bar').style.width = (total ? (d.wet / total * 100) : 50) + '%';
+    $('state').textContent = d.state;
+    $('last').textContent = d.last + (d.lastSoil ? ' (soil ' + d.lastSoil + ')' : '');
+    $('soil').textContent = d.soil;
+    $('connTxt').textContent = 'Connected';
+    document.body.classList.remove('offline');
+  } catch (e) {
+    $('connTxt').textContent = 'Disconnected';
+    document.body.classList.add('offline');
+  }
+}
+async function resetCounts() {
+  if (confirm('Reset wet and dry counts to zero?')) {
+    await fetch('/reset');
+    update();
+  }
+}
+update();
+setInterval(update, 1500);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ================= Web handlers =================
+const char* stateName() {
+  switch (state) {
+    case IDLE:     return "Ready";
+    case SETTLING: return "Waste detected...";
+    case TILTED:   return "Sorting";
+    case COOLDOWN: return "Clearing tray";
+  }
+  return "-";
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"wet\":"      + String(wetCount) + ",";
+  json += "\"dry\":"      + String(dryCount) + ",";
+  json += "\"last\":\""   + lastItem + "\",";
+  json += "\"lastSoil\":" + String(lastSoil) + ",";
+  json += "\"soil\":"     + String(analogRead(SOIL_PIN)) + ",";
+  json += "\"state\":\""  + String(stateName()) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleReset() {
+  wetCount = 0;
+  dryCount = 0;
+  lastItem = "None yet";
+  lastSoil = 0;
+  prefs.putULong("wet", 0);
+  prefs.putULong("dry", 0);
+  server.send(200, "text/plain", "OK");
+}
+
+// ================= Sensors =================
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);   // 30 ms timeout
+  if (duration == 0) return 999;                    // no echo
+  return duration * 0.0343 / 2.0;
+}
+
+bool objectPresent() {
+  for (int i = 0; i < 3; i++) {                     // 3 readings to avoid false triggers
+    if (readDistanceCm() > DETECT_CM) return false;
+    delay(30);
+  }
+  return true;
+}
+
+int readSoilAverage() {
+  long sum = 0;
+  for (int i = 0; i < SOIL_SAMPLES; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(5);
+  }
+  return sum / SOIL_SAMPLES;
+}
+
+// ================= Setup =================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  analogReadResolution(12);
+
+  servoAttach();
+  servoWrite(ANGLE_CENTER);
+
+  prefs.begin("dustbin", false);
+  wetCount = prefs.getULong("wet", 0);
+  dryCount = prefs.getULong("dry", 0);
+
+  if (USE_HOME_WIFI) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(HOME_SSID, HOME_PASS);
+    Serial.print("Connecting to WiFi");
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println();
+      Serial.print("Open in browser: http://");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("\nWiFi failed, starting own hotspot instead.");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      Serial.print("Open in browser: http://");
+      Serial.println(WiFi.softAPIP());
+    }
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.print("Connect to WiFi '");
+    Serial.print(AP_SSID);
+    Serial.print("' then open: http://");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/reset", handleReset);
+  server.begin();
+
+  Serial.print("Soil threshold (below = WET): ");
+  Serial.println(SOIL_THRESHOLD);
+  Serial.println("Smart Dustbin ready.");
+}
+
+// ================= Loop =================
+void loop() {
+  server.handleClient();     // keeps website responsive
+
+  unsigned long now = millis();
+
+  switch (state) {
+
+    case IDLE:
+      if (now - lastPoll >= 200) {
+        lastPoll = now;
+        if (objectPresent()) {
+          Serial.println("Waste detected, waiting to settle...");
+          state = SETTLING;
+          stateStart = now;
+        }
+      }
+      break;
+
+    case SETTLING:
+      if (now - stateStart >= SETTLE_MS) {
+        if (!objectPresent()) {          // false trigger, waste removed
+          state = IDLE;
+          break;
+        }
+        lastSoil = readSoilAverage();
+        Serial.print("Soil reading: ");
+        Serial.println(lastSoil);
+
+        if (lastSoil < SOIL_THRESHOLD) {
+          Serial.println("-> WET waste");
+          wetCount++;
+          lastItem = "Wet";
+          prefs.putULong("wet", wetCount);
+          servoWrite(ANGLE_WET);
+        } else {
+          Serial.println("-> DRY waste");
+          dryCount++;
+          lastItem = "Dry";
+          prefs.putULong("dry", dryCount);
+          servoWrite(ANGLE_DRY);
+        }
+        state = TILTED;
+        stateStart = millis();
+      }
+      break;
+
+    case TILTED:
+      if (now - stateStart >= TILT_HOLD_MS) {
+        servoWrite(ANGLE_CENTER);
+        state = COOLDOWN;
+        stateStart = now;
+      }
+      break;
+
+    case COOLDOWN:
+      if (now - stateStart >= COOLDOWN_MS && now - lastPoll >= 200) {
+        lastPoll = now;
+        if (!objectPresent()) {          // wait until tray is clear
+          state = IDLE;
+        }
+      }
+      break;
+  }
+}
